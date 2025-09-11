@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Drone Mesh Dashboard</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        #dashboard {
+            display: flex;
+            height: 100vh;
+        }
+        #map-container {
+            flex: 1;
+            position: relative;
+            background: #2a2a2a;
+            overflow: hidden;
+            border: 2px solid #444;
+        }
+        #map-canvas {
+            width: 100%;
+            height: 100%;
+            cursor: grab;
+            background: #1e3a5f;
+        }
+        #map-canvas:active {
+            cursor: grabbing;
+        }
+        #table-container {
+            width: 450px;
+            background: #2a2a2a;
+            border-left: 2px solid #444;
+            padding: 20px;
+            box-sizing: border-box;
+            overflow-y: auto;
+        }
+        h2 {
+            margin-top: 0;
+            color: #4CAF50;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            border: 1px solid #555;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #3a3a3a;
+            color: #4CAF50;
+        }
+        tr:nth-child(even) {
+            background-color: #333;
+        }
+        .controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+        }
+        .zoom-btn, .connect-btn {
+            background: #4CAF50;
+            border: none;
+            color: white;
+            padding: 8px 12px;
+            margin: 2px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .zoom-btn:hover, .connect-btn:hover {
+            background: #45a049;
+        }
+        .zoom-btn:active, .connect-btn:active {
+            transform: scale(0.95);
+        }
+        .status {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            border: 1px solid #444;
+        }
+        .status.connected {
+            border-left: 4px solid #4CAF50;
+        }
+        .status.disconnected {
+            border-left: 4px solid #f44336;
+        }
+        #ip-selector {
+            margin-bottom: 10px;
+        }
+        #ip-input {
+            padding: 5px;
+            margin-right: 5px;
+            border-radius: 5px;
+            border: 1px solid #555;
+            background: #333;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <div id="dashboard">
+        <div id="map-container">
+            <canvas id="map-canvas"></canvas>
+            <div class="controls">
+                <div style="color: #ccc; margin-bottom: 5px; font-size: 12px;">Управление</div>
+                <button class="zoom-btn" onclick="zoomIn()">Zoom +</button>
+                <button class="zoom-btn" onclick="zoomOut()">Zoom -</button>
+                <button class="zoom-btn" onclick="resetView()">Reset</button>
+                <div style="color: #ccc; margin-top: 5px; font-size: 11px;">
+                    Zoom: <span id="zoom-level">10</span>
+                </div>
+                <div id="ip-selector">
+                    <input id="ip-input" type="text" placeholder="Enter Orange Pi IP" value="192.168.0.104">
+                    <button class="connect-btn" onclick="connectToServer()">Connect</button>
+                </div>
+            </div>
+            <div id="connection-status" class="status disconnected">
+                Disconnected
+            </div>
+        </div>
+        <div id="table-container">
+            <h2>Drone Network Status</h2>
+            <table id="drone-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Latitude</th>
+                        <th>Longitude</th>
+                        <th>Last Seen</th>
+                        <th>Signal (dBm)</th>
+                    </tr>
+                </thead>
+                <tbody id="drone-table-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.0/socket.io.min.js"></script>
+    <script>
+        const CONFIG = {
+            TILE_PATH: './tiles',
+            TILE_SIZE: 256,
+            INITIAL_ZOOM: 10,
+            MIN_ZOOM: 1,
+            MAX_ZOOM: 15,
+            INITIAL_LAT: 55.7558,
+            INITIAL_LON: 37.6176
+        };
+
+        let appState = {
+            zoom: CONFIG.INITIAL_ZOOM,
+            centerLat: CONFIG.INITIAL_LAT,
+            centerLon: CONFIG.INITIAL_LON,
+            offsetX: 0,
+            offsetY: 0,
+            isDragging: false,
+            lastMouseX: 0,
+            lastMouseY: 0,
+            tilesLoaded: 0,
+            tilesTotal: 0,
+            loadedTiles: new Map(),
+            drones: { self: null, neighbors: [] },
+            socket: null
+        };
+
+        const canvas = document.getElementById('map-canvas');
+        const ctx = canvas.getContext('2d');
+        const connectionStatus = document.getElementById('connection-status');
+        const droneTableBody = document.getElementById('drone-table-body');
+
+        function connectToServer() {
+            const ip = document.getElementById('ip-input').value;
+            if (appState.socket) {
+                appState.socket.disconnect();
+            }
+            console.log(`Attempting to connect to ws://${ip}:5000`);
+            appState.socket = io(`ws://${ip}:5000`, { transports: ['websocket'] });
+            appState.socket.on('connect', () => {
+                console.log('Connected to server');
+                connectionStatus.textContent = `Connected to ${ip}`;
+                connectionStatus.className = 'status connected';
+            });
+            appState.socket.on('connect_error', (error) => {
+                console.error('WebSocket connection error:', error);
+                connectionStatus.textContent = `Connection failed: ${error.message}`;
+                connectionStatus.className = 'status disconnected';
+            });
+            appState.socket.on('disconnect', () => {
+                console.log('Disconnected from server');
+                connectionStatus.textContent = 'Disconnected';
+                connectionStatus.className = 'status disconnected';
+            });
+            appState.socket.on('drone_data', (data) => {
+                console.log('Received drone data:', data);
+                appState.drones = data;
+                updateDroneTable();
+                drawMap();
+            });
+        }
+
+        function resizeCanvas() {
+            const container = canvas.parentElement;
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+            drawMap();
+        }
+
+        function deg2num(lat_deg, lon_deg, zoom) {
+            const lat_rad = lat_deg * Math.PI / 180;
+            const n = Math.pow(2, zoom);
+            const x = Math.floor((lon_deg + 180) / 360 * n);
+            const y = Math.floor((1 - Math.asinh(Math.tan(lat_rad)) / Math.PI) / 2 * n);
+            return [x, y];
+        }
+
+        // Новая функция для конвертации координат в пиксели на экране
+        function latLonToPixels(lat, lon) {
+            const lat_rad = lat * Math.PI / 180;
+            const n = Math.pow(2, appState.zoom);
+
+            // Получаем точные tile координаты (не округленные)
+            const tileX = (lon + 180) / 360 * n;
+            const tileY = (1 - Math.asinh(Math.tan(lat_rad)) / Math.PI) / 2 * n;
+
+            // Координаты центра карты в tile coordinates
+            const centerTileCoords = deg2num(appState.centerLat, appState.centerLon, appState.zoom);
+
+            // Пиксельные координаты на экране
+            const pixelX = canvas.width / 2 + (tileX - centerTileCoords[0]) * CONFIG.TILE_SIZE + appState.offsetX;
+            const pixelY = canvas.height / 2 + (tileY - centerTileCoords[1]) * CONFIG.TILE_SIZE + appState.offsetY;
+
+            return [pixelX, pixelY];
+        }
+
+        function loadTile(z, x, y) {
+            const tileKey = `${z}-${x}-${y}`;
+            if (appState.loadedTiles.has(tileKey)) {
+                return appState.loadedTiles.get(tileKey);
+            }
+            const img = new Image();
+            const tileUrl = `${CONFIG.TILE_PATH}/${z}/${x}/${y}.png`;
+            img.onload = () => {
+                appState.tilesLoaded++;
+                drawMap();
+            };
+            img.onerror = () => {
+                console.log(`Tile not found: ${tileUrl}`);
+                const canvas = document.createElement('canvas');
+                canvas.width = CONFIG.TILE_SIZE;
+                canvas.height = CONFIG.TILE_SIZE;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#2a2a2a';
+                ctx.fillRect(0, 0, CONFIG.TILE_SIZE, CONFIG.TILE_SIZE);
+                ctx.strokeStyle = '#444';
+                ctx.strokeRect(0, 0, CONFIG.TILE_SIZE, CONFIG.TILE_SIZE);
+                ctx.fillStyle = '#666';
+                ctx.font = '12px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(`${z}/${x}/${y}`, CONFIG.TILE_SIZE/2, CONFIG.TILE_SIZE/2);
+                img.src = canvas.toDataURL();
+            };
+            img.src = tileUrl;
+            appState.loadedTiles.set(tileKey, img);
+            appState.tilesTotal++;
+            return img;
+        }
+
+        function drawMap() {
+            ctx.fillStyle = '#1e3a5f';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const centerTile = deg2num(appState.centerLat, appState.centerLon, appState.zoom);
+            const tilesNeeded = Math.ceil(Math.max(canvas.width, canvas.height) / CONFIG.TILE_SIZE) + 2;
+            for (let dx = -tilesNeeded; dx <= tilesNeeded; dx++) {
+                for (let dy = -tilesNeeded; dy <= tilesNeeded; dy++) {
+                    const tileX = centerTile[0] + dx;
+                    const tileY = centerTile[1] + dy;
+                    if (tileX < 0 || tileY < 0 || tileX >= Math.pow(2, appState.zoom) || tileY >= Math.pow(2, appState.zoom)) {
+                        continue;
+                    }
+                    const img = loadTile(appState.zoom, tileX, tileY);
+                    if (img.complete && img.naturalWidth > 0) {
+                        const pixelX = canvas.width / 2 + (tileX - centerTile[0]) * CONFIG.TILE_SIZE + appState.offsetX;
+                        const pixelY = canvas.height / 2 + (tileY - centerTile[1]) * CONFIG.TILE_SIZE + appState.offsetY;
+                        ctx.drawImage(img, pixelX, pixelY, CONFIG.TILE_SIZE, CONFIG.TILE_SIZE);
+                    }
+                }
+            }
+            drawDrones();
+        }
+
+        function drawDrones() {
+            if (!appState.drones.self) return;
+
+            // Рисуем свой дрон (красная точка)
+            const selfPixels = latLonToPixels(appState.drones.self.x, appState.drones.self.y);
+
+            // Более приятный размер точки
+            const dotSize = Math.max(4, Math.min(10, appState.zoom - 4));
+
+            ctx.fillStyle = '#ff4444';
+            ctx.beginPath();
+            ctx.arc(selfPixels[0], selfPixels[1], dotSize, 0, 2 * Math.PI);
+            ctx.fill();
+
+            // Обводка для лучшей видимости
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // Черный текст с белой обводкой для лучшей читаемости
+            ctx.font = 'bold 12px Arial';
+            ctx.textAlign = 'center';
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3;
+            ctx.strokeText(appState.drones.self.id, selfPixels[0], selfPixels[1] - dotSize - 5);
+            ctx.fillStyle = '#000000';
+            ctx.fillText(appState.drones.self.id, selfPixels[0], selfPixels[1] - dotSize - 5);
+
+            // Рисуем соседей (зеленые точки)
+            appState.drones.neighbors.forEach(neighbor => {
+                const neighborPixels = latLonToPixels(neighbor.x, neighbor.y);
+
+                ctx.fillStyle = '#44ff44';
+                ctx.beginPath();
+                ctx.arc(neighborPixels[0], neighborPixels[1], dotSize - 1, 0, 2 * Math.PI);
+                ctx.fill();
+
+                // Обводка
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // Черный текст с белой обводкой
+                ctx.font = 'bold 12px Arial';
+                ctx.textAlign = 'center';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 3;
+                ctx.strokeText(neighbor.id, neighborPixels[0], neighborPixels[1] - dotSize - 5);
+                ctx.fillStyle = '#000000';
+                ctx.fillText(neighbor.id, neighborPixels[0], neighborPixels[1] - dotSize - 5);
+            });
+        }
+
+        function updateDroneTable() {
+            droneTableBody.innerHTML = '';
+            if (appState.drones.self) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${appState.drones.self.id} (Self)</td>
+                    <td>${appState.drones.self.x.toFixed(6)}</td>
+                    <td>${appState.drones.self.y.toFixed(6)}</td>
+                    <td>-</td>
+                    <td>N/A</td>
+                `;
+                droneTableBody.appendChild(row);
+            }
+            appState.drones.neighbors.forEach(neighbor => {
+                const row = document.createElement('tr');
+                const dBmValue = (neighbor.dBm !== undefined && neighbor.dBm !== null) ? neighbor.dBm.toFixed(1) : 'N/A';
+                row.innerHTML = `
+                    <td>${neighbor.id}</td>
+                    <td>${neighbor.x.toFixed(6)}</td>
+                    <td>${neighbor.y.toFixed(6)}</td>
+                    <td>${new Date(neighbor.timestamp * 1000).toLocaleTimeString()}</td>
+                    <td>${dBmValue}</td>
+                `;
+                droneTableBody.appendChild(row);
+            });
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            appState.isDragging = true;
+            appState.lastMouseX = e.clientX;
+            appState.lastMouseY = e.clientY;
+            canvas.style.cursor = 'grabbing';
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            if (appState.isDragging) {
+                const deltaX = e.clientX - appState.lastMouseX;
+                const deltaY = e.clientY - appState.lastMouseY;
+                appState.offsetX += deltaX;
+                appState.offsetY += deltaY;
+                appState.lastMouseX = e.clientX;
+                appState.lastMouseY = e.clientY;
+                drawMap();
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            appState.isDragging = false;
+            canvas.style.cursor = 'grab';
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            appState.isDragging = false;
+            canvas.style.cursor = 'grab';
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const zoomDelta = e.deltaY > 0 ? -1 : 1;
+            const newZoom = Math.max(CONFIG.MIN_ZOOM, Math.min(CONFIG.MAX_ZOOM, appState.zoom + zoomDelta));
+            if (newZoom !== appState.zoom) {
+                appState.zoom = newZoom;
+                appState.loadedTiles.clear();
+                appState.tilesLoaded = 0;
+                appState.tilesTotal = 0;
+                drawMap();
+                document.getElementById('zoom-level').textContent = appState.zoom;
+            }
+        });
+
+        function zoomIn() {
+            if (appState.zoom < CONFIG.MAX_ZOOM) {
+                appState.zoom++;
+                appState.loadedTiles.clear();
+                appState.tilesLoaded = 0;
+                appState.tilesTotal = 0;
+                drawMap();
+                document.getElementById('zoom-level').textContent = appState.zoom;
+            }
+        }
+
+        function zoomOut() {
+            if (appState.zoom > CONFIG.MIN_ZOOM) {
+                appState.zoom--;
+                appState.loadedTiles.clear();
+                appState.tilesLoaded = 0;
+                appState.tilesTotal = 0;
+                drawMap();
+                document.getElementById('zoom-level').textContent = appState.zoom;
+            }
+        }
+
+        function resetView() {
+            appState.offsetX = 0;
+            appState.offsetY = 0;
+            appState.zoom = CONFIG.INITIAL_ZOOM;
+            appState.centerLat = CONFIG.INITIAL_LAT;
+            appState.centerLon = CONFIG.INITIAL_LON;
+            appState.loadedTiles.clear();
+            appState.tilesLoaded = 0;
+            appState.tilesTotal = 0;
+            drawMap();
+            document.getElementById('zoom-level').textContent = appState.zoom;
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        connectToServer(); // Автоподключение при загрузке
+        console.log('Drone Dashboard initialized');
+    </script>
+</body>
+</html>
